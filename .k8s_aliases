@@ -1,0 +1,350 @@
+#!/bin/bash
+
+# Namespace
+export AXON_NS="axon"
+
+# Colors - using printf format for better compatibility
+GREEN=$(printf '\033[0;32m')
+YELLOW=$(printf '\033[1;33m')
+RED=$(printf '\033[0;31m')
+BLUE=$(printf '\033[0;34m')
+NC=$(printf '\033[0m')
+
+# --- Resolve app name (always returns clean single value) ---
+resolveapp() {
+  local query="$1"
+  if [[ -z "$query" ]]; then
+    echo -e "${RED}❌ Please provide an app name fragment${NC}" >&2
+    return 1
+  fi
+  
+  # Get all unique app labels from pods
+  local pod_apps=$(kubectl get pods -n "$AXON_NS" \
+    -o jsonpath='{range .items[*]}{.metadata.labels.app}{"\n"}{end}' 2>/dev/null | \
+    grep -v '^$' | sort -u)
+  
+  # Get all deployment names as fallback
+  local deployment_names=$(kubectl get deployments -n "$AXON_NS" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | \
+    sort -u)
+  
+  # Combine both sources
+  local all_apps=$(echo -e "${pod_apps}\n${deployment_names}" | grep -v '^$' | sort -u)
+  
+  if [[ -z "$all_apps" ]]; then
+    echo -e "${RED}❌ No apps found in namespace '$AXON_NS'${NC}" >&2
+    return 1
+  fi
+  
+  # Find matches (case-insensitive)
+  local matches=$(echo "$all_apps" | grep -i "$query" | sort -u)
+  local count=$(echo "$matches" | grep -c . 2>/dev/null || echo "0")
+  
+  if [[ $count -eq 0 ]]; then
+    echo -e "${RED}❌ No match found for '$query'${NC}" >&2
+    echo -e "${BLUE}Available apps:${NC}" >&2
+    echo "$all_apps" | head -10 >&2
+    return 1
+  elif [[ $count -eq 1 ]]; then
+    echo "$matches"
+  else
+    echo -e "${YELLOW}⚠️ Multiple matches found for '$query':${NC}" >&2
+    local i=1
+    while IFS= read -r match; do
+      echo "$i. $match" >&2
+      ((i++))
+    done <<< "$matches"
+    
+    echo -n "Enter choice number (1-$count): " >&2
+    read -r choice
+    
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "$count" ]]; then
+      echo -e "${RED}❌ Invalid choice${NC}" >&2
+      return 1
+    fi
+    
+    echo "$matches" | sed -n "${choice}p"
+  fi
+}
+
+# --- Images ---
+kimgs() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Using app:${NC} $app" >&2
+  kubectl get pods -n "$AXON_NS" -l app="$app" \
+    -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
+}
+
+# --- Pods ---
+kpods() {
+  if [[ -z "$1" ]]; then
+    kubectl get pods -n "$AXON_NS" -o wide
+  else
+    local app=$(resolveapp "$1") || return 1
+    echo -e "${GREEN}✔ Using app:${NC} $app" >&2
+    kubectl get pods -n "$AXON_NS" -l app="$app" -o wide
+  fi
+}
+
+# --- Deployments ---
+kdeps() {
+  if [[ -z "$1" ]]; then
+    kubectl get deployments -n "$AXON_NS"
+  else
+    local app=$(resolveapp "$1") || return 1
+    echo -e "${GREEN}✔ Using app:${NC} $app" >&2
+    kubectl get deployment -n "$AXON_NS" "$app" 2>/dev/null || \
+    kubectl get deployments -n "$AXON_NS" -l app="$app"
+  fi
+}
+
+# --- Restarts ---
+krestarts() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Using app:${NC} $app" >&2
+  kubectl get pods -n "$AXON_NS" -l app="$app" \
+    -o custom-columns="POD:.metadata.name,CONTAINER:.spec.containers[*].name,RESTARTS:.status.containerStatuses[*].restartCount"
+}
+
+# --- Describe Pods ---
+kdescribe() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Using app:${NC} $app" >&2
+  kubectl describe pods -n "$AXON_NS" -l app="$app"
+}
+
+# --- Delete Pods (restart them) ---
+kdelete() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${YELLOW}⚠️ This will delete all pods for app '$app'. Continue? (y/n)${NC}" >&2
+  read -r confirm
+  if [[ "$confirm" =~ ^[yY]$ ]]; then
+    kubectl delete pods -n "$AXON_NS" -l app="$app"
+  else
+    echo -e "${BLUE}Operation cancelled${NC}"
+  fi
+}
+
+# --- Scale Deployment ---
+kscale() {
+  local app=$(resolveapp "$1") || return 1
+  local replicas="$2"
+  if [[ -z "$replicas" ]]; then
+    echo -e "${RED}❌ Please provide number of replicas${NC}" >&2
+    return 1
+  fi
+  echo -e "${GREEN}✔ Scaling app:${NC} $app to $replicas replicas" >&2
+  kubectl scale deployment -n "$AXON_NS" "$app" --replicas="$replicas"
+}
+
+# --- Restart Deployment ---
+krestart() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Restarting deployment:${NC} $app" >&2
+  kubectl rollout restart deployment -n "$AXON_NS" "$app"
+}
+
+# --- Latest Pod ---
+latestpod() {
+  local app=$(resolveapp "$1") || return 1
+  kubectl get pods -n "$AXON_NS" -l app="$app" \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].metadata.name}'
+}
+
+# --- Select Pod (when multiple exist) ---
+selectpod() {
+  local app=$(resolveapp "$1") || return 1
+  local pods=$(kubectl get pods -n "$AXON_NS" -l app="$app" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+  
+  if [[ -z "$pods" ]]; then
+    echo -e "${RED}❌ No pods found for app '$app'${NC}" >&2
+    return 1
+  fi
+  
+  local count=$(echo "$pods" | wc -l)
+  if [[ $count -eq 1 ]]; then
+    echo "$pods"
+  else
+    echo -e "${YELLOW}Multiple pods found for '$app':${NC}" >&2
+    local i=1
+    while IFS= read -r pod; do
+      echo "$i. $pod" >&2
+      ((i++))
+    done <<< "$pods"
+    
+    echo -n "Enter choice number (1-$count) or press Enter for latest: " >&2
+    read -r choice
+    
+    if [[ -z "$choice" ]]; then
+      latestpod "$app"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$count" ]]; then
+      echo "$pods" | sed -n "${choice}p"
+    else
+      echo -e "${RED}❌ Invalid choice${NC}" >&2
+      return 1
+    fi
+  fi
+}
+
+# --- Logs ---
+klogs() {
+  local app=$(resolveapp "$1") || return 1
+  local pod=$(selectpod "$app") || return 1
+  echo -e "${GREEN}✔ Using pod:${NC} $pod" >&2
+  kubectl logs -f "$pod" -n "$AXON_NS" "${@:2}"
+}
+
+# --- Exec ---
+kexec() {
+  local app=$(resolveapp "$1") || return 1
+  local pod=$(selectpod "$app") || return 1
+  echo -e "${GREEN}✔ Using pod:${NC} $pod" >&2
+  local shell="${2:-/bin/bash}"
+  kubectl exec -it "$pod" -n "$AXON_NS" -- "$shell"
+}
+
+# --- SSH (alias for exec) ---
+kssh() {
+  kexec "$@"
+}
+
+# --- Edit Deployment ---
+kedit() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Editing deployment:${NC} $app" >&2
+  kubectl edit deployment -n "$AXON_NS" "$app"
+}
+
+# --- Deploy new image tag ---
+kdeploy() {
+  local app=$(resolveapp "$1") || return 1
+  local new_tag="$2"
+  
+  if [[ -z "$new_tag" ]]; then
+    echo -e "${RED}❌ Please provide a new image tag${NC}" >&2
+    echo -e "${BLUE}Usage: kdeploy <app> <new-tag>${NC}" >&2
+    echo -e "${BLUE}Example: kdeploy shell v1.2.3${NC}" >&2
+    return 1
+  fi
+  
+  echo -e "${GREEN}✔ Deploying new tag for app:${NC} $app" >&2
+  
+  # Get current image
+  local current_image=$(kubectl get deployment -n "$AXON_NS" "$app" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+  
+  if [[ -z "$current_image" ]]; then
+    echo -e "${RED}❌ Could not find deployment or image for '$app'${NC}" >&2
+    return 1
+  fi
+  
+  echo -e "${BLUE}Current image:${NC} $current_image" >&2
+  
+  # Extract image name without tag (everything before the last :)
+  local image_base="${current_image%:*}"
+  local current_tag="${current_image##*:}"
+  local new_image="${image_base}:${new_tag}"
+  
+  echo -e "${BLUE}New image:${NC} $new_image" >&2
+  echo -e "${YELLOW}Updating from tag '${current_tag}' to '${new_tag}'${NC}" >&2
+  
+  # Confirm before proceeding
+  echo -n "Continue with deployment? (y/n): " >&2
+  read -r confirm
+  if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+    echo -e "${BLUE}Deployment cancelled${NC}" >&2
+    return 0
+  fi
+  
+  # Update the deployment
+  kubectl set image deployment/"$app" -n "$AXON_NS" \
+    $(kubectl get deployment -n "$AXON_NS" "$app" \
+      -o jsonpath='{.spec.template.spec.containers[0].name}')="$new_image"
+  
+  if [[ $? -eq 0 ]]; then
+    echo -e "${GREEN}✔ Deployment updated successfully!${NC}" >&2
+    echo -e "${BLUE}Monitoring rollout status...${NC}" >&2
+    kubectl rollout status deployment/"$app" -n "$AXON_NS"
+    
+    # Show the updated pods
+    echo -e "\n${BLUE}Updated pods:${NC}" >&2
+    kubectl get pods -n "$AXON_NS" -l app="$app" -o wide
+  else
+    echo -e "${RED}❌ Failed to update deployment${NC}" >&2
+    return 1
+  fi
+}
+
+# --- Status Check ---
+kstatus() {
+  local app=$(resolveapp "$1") || return 1
+  echo -e "${GREEN}✔ Status for app:${NC} $app" >&2
+  echo -e "\n${BLUE}Deployment:${NC}"
+  kubectl get deployment -n "$AXON_NS" "$app" 2>/dev/null || kubectl get deployments -n "$AXON_NS" -l app="$app"
+  echo -e "\n${BLUE}Pods:${NC}"
+  kubectl get pods -n "$AXON_NS" -l app="$app" -o wide
+  echo -e "\n${BLUE}Recent Events:${NC}"
+  kubectl get events -n "$AXON_NS" --field-selector involvedObject.name="$app" --sort-by='.lastTimestamp' | tail -5
+}
+
+# --- List all apps ---
+kapps() {
+  echo -e "${BLUE}Apps in namespace '$AXON_NS':${NC}"
+  local pod_apps=$(kubectl get pods -n "$AXON_NS" \
+    -o jsonpath='{range .items[*]}{.metadata.labels.app}{"\n"}{end}' 2>/dev/null | \
+    grep -v '^$' | sort -u)
+  
+  local deployment_names=$(kubectl get deployments -n "$AXON_NS" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | \
+    sort -u)
+  
+  echo -e "${pod_apps}\n${deployment_names}" | grep -v '^$' | sort -u | nl -w2 -s'. '
+}
+
+# --- Documentation ---
+kdoc() {
+  printf "${GREEN}Available Kubectl Helper Commands:${NC}\n\n"
+  
+  printf "${YELLOW}Basic Operations:${NC}\n"
+  printf "  kapps               - List all available apps\n"
+  printf "  kpods [<app>]       - List pods (all or filtered by app)\n"
+  printf "  kdeps [<app>]       - Show deployments (all or filtered by app)\n"
+  printf "  kimgs <app>         - Show container images for app\n"
+  printf "  kstatus <app>       - Show comprehensive status for app\n\n"
+  
+  printf "${YELLOW}Pod Management:${NC}\n"
+  printf "  klogs <app>         - Tail logs (with pod selection if multiple)\n"
+  printf "  kexec <app> [shell] - Exec into pod (default: /bin/bash)\n"
+  printf "  kssh <app>          - Alias for kexec\n"
+  printf "  kdelete <app>       - Delete pods (restart them)\n\n"
+  
+  printf "${YELLOW}Deployment Management:${NC}\n"
+  printf "  kscale <app> <n>    - Scale deployment to n replicas\n"
+  printf "  krestart <app>      - Restart deployment (rolling restart)\n"
+  printf "  kedit <app>         - Edit deployment configuration\n"
+  printf "  kdeploy <app> <tag> - Deploy new image tag\n\n"
+  
+  printf "${YELLOW}Monitoring:${NC}\n"
+  printf "  krestarts <app>     - Show restart counts\n"
+  printf "  kdescribe <app>     - Describe pods\n\n"
+  
+  printf "${YELLOW}Utilities:${NC}\n"
+  printf "  latestpod <app>     - Get latest pod name\n"
+  printf "  selectpod <app>     - Interactively select a pod\n"
+  printf "  kdoc               - Show this help\n\n"
+  
+  printf "${BLUE}Features:${NC}\n"
+  printf "- Fuzzy matching: partial app names work (e.g., 'shell' matches 'axon-shell-api')\n"
+  printf "- Multi-selection: when multiple matches, you get options to choose\n"
+  printf "- Smart pod selection: automatically uses latest pod or lets you choose\n"
+  printf "- Error handling: clear error messages with suggestions\n\n"
+  
+  printf "${BLUE}Examples:${NC}\n"
+  printf "  kpods shell         # Lists pods for axon-shell-api\n"
+  printf "  klogs comm          # Tail logs for axon-communication-service\n"
+  printf "  kexec mock          # Exec into axon-mock-switch pod\n"
+  printf "  kscale shell 3      # Scale axon-shell-api to 3 replicas\n"
+  printf "  kdeploy castor v1.2.3 # Deploy new tag v1.2.3 to axon-castor\n"
+}
